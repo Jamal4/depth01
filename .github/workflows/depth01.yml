@@ -36,6 +36,7 @@ jobs:
 
       - name: Collect
         if: ${{ inputs.universe_only != true }}
+        timeout-minutes: 310            # below the job's 330: finalize + upload still run after a hang
         env:
           CODES: ${{ inputs.codes }}
         run: python3 collector.py run --out out --codes "${CODES:-}"

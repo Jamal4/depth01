@@ -35,6 +35,8 @@ import csv
 import gzip
 import hashlib
 import html.parser
+import io
+import http.client
 import json
 import os
 import re
@@ -59,6 +61,7 @@ MIN_GAP_S = 2.0                              # one request every 2 s, one at a t
 BACKOFF_S = (2, 4, 8, 16, 32, 60)            # 2 s doubling to 60 s; still failing after these -> stop the day
 TIMEOUT_S = 20
 NEVER_OPEN_GRACE_S = 30 * 60                 # DSE never reports the session open this long after the open -> stop
+CLOSED_CONFIRM_S = 120                       # isOpen False must hold this long after the open was seen -> stop
 CSV_COLS = ["session_date", "fetch_utc", "as_of", "phase", "trading_code", "side", "level", "price", "quantity",
             "orders"]
 WEEKEND = (4, 5)                             # Friday, Saturday (date.weekday())
@@ -79,13 +82,16 @@ def user_agent() -> str:
 
 
 def urllib_fetch(url: str, headers: dict, timeout: float):
-    """(status, body). Network errors (timeout, DNS, reset) raise OSError."""
+    """(status, body). Network errors (timeout, DNS, reset, a body cut short) raise OSError."""
     req = urllib.request.Request(url, headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
             return r.status, r.read()
-    except urllib.error.HTTPError as e:
-        return e.code, (e.read() if e.fp else b"")
+    except urllib.error.HTTPError as e:              # the error body is never used: not read (it can be cut short)
+        e.close()
+        return e.code, b""
+    except http.client.HTTPException as e:       # IncompleteRead, BadStatusLine: back off like any network fault
+        raise OSError(f"{type(e).__name__}: {e}") from e
 
 
 class Http:
@@ -173,12 +179,12 @@ def tables(html_text: str) -> list:
 
 
 def codes_from_list_page(html_text: str, what: str) -> set:
-    """The going-concern / closed-companies page: one table, trading code in column 2 (header row skipped)."""
+    """The going-concern / closed-companies page: the largest table, trading code in column 2 (header skipped)."""
     tabs = [t for t in tables(html_text) if len(t) >= 2]
     if not tabs:
         raise StopDay(f"{what}: no table on the page")
     codes = set()
-    for row in tabs[0][1:]:
+    for row in max(tabs, key=len)[1:]:              # the list itself, not a smaller layout table before it
         if len(row) >= 2 and row[1] and not re.search(r"trading\s*code", row[1], re.I):
             codes.add(row[1].strip().upper())
     if not codes:
@@ -227,6 +233,8 @@ def holidays_from_page(html_text: str, default_year: int) -> set:
     m = re.search(r"Calendar\s+Year\s*[:\-]?\s*(20\d{2})", plain, re.I) or re.search(r"\bYear\s+(20\d{2})", plain)
     year = int(m.group(1)) if m else default_year
     for tab in tables(html_text):
+        if not tab:                                  # an empty layout/wrapper table
+            continue
         head = [c.lower() for c in tab[0]]
         name_i = next((i for i, c in enumerate(head) if "holiday" in c), None)
         date_i = next((i for i, c in enumerate(head) if c.strip() == "date"), None)
@@ -319,7 +327,8 @@ def build_universe(prices, day_end_fetch, going_concern: set, closed: set, after
 # ------------------------------------------------------------------ depth
 def ladder_rows(payload: dict, code: str, session_date: str, fetch_utc: str):
     """(rows, bad_levels). rows follow CSV_COLS. An empty book -> one 'none' row."""
-    phase = str((payload.get("session") or {}).get("phase") or "")
+    sess = payload.get("session")
+    phase = str((sess if isinstance(sess, dict) else {}).get("phase") or "")
     base = [session_date, fetch_utc, str(payload.get("asOf") or ""), phase, code]
     out, bad = [], 0
     for side, key in (("bid", "bids"), ("ask", "asks")):
@@ -374,8 +383,10 @@ class Collector:
     def _write_status(self, **kw) -> None:
         self.status.update(kw)
         os.makedirs(self.out, exist_ok=True)
-        with open(os.path.join(self.out, "status.json"), "w", encoding="utf-8") as f:
+        path = os.path.join(self.out, "status.json")
+        with open(path + ".tmp", "w", encoding="utf-8") as f:     # a job killed mid-write keeps the old file
             json.dump(self.status, f, indent=1)
+        os.replace(path + ".tmp", path)
 
     def _csv_path(self, day: str, test: bool) -> str:
         return os.path.join(self.out, f"depth01{'test' if test else ''}-{day}.csv")
@@ -398,7 +409,8 @@ class Collector:
             self.status["bad_levels"] = self.status.get("bad_levels", 0) + bad
         for r in rows:
             writer.writerow(r)
-        self.last_session = payload.get("session") or {}
+        sess = payload.get("session")
+        self.last_session = sess if isinstance(sess, dict) else {}
         return len(rows)
 
     def run(self, codes=None) -> int:
@@ -411,6 +423,10 @@ class Collector:
         except (StopDay, NotFound) as e:            # NotFound here = a source page/API gone (404)
             self.log(f"STOPPED for the day: {type(e).__name__}: {e}")
             self._write_status(state="stopped", stop_reason=f"{type(e).__name__}: {e}")
+            return 1
+        except Exception as e:  # noqa: BLE001  a fault not foreseen: keep what was collected + why, exit 1
+            self.log(f"CRASHED: {type(e).__name__}: {e}")
+            self._write_status(state="crashed", stop_reason=f"{type(e).__name__}: {e}")
             return 1
         finally:
             self._write_status(requests=self.http.requests, failures=self.http.failures,
@@ -436,7 +452,9 @@ class Collector:
         session = None
         for code in sorted(eq_codes(rows_as_dicts(prices))):   # DSE's session block, from the first EQ code answered
             try:
-                session = (self.http.json(DEPTH_HOST + DEPTH_PATH.format(code=code)) or {}).get("session") or {}
+                ans = self.http.json(DEPTH_HOST + DEPTH_PATH.format(code=code))
+                session = ans.get("session") if isinstance(ans, dict) else None
+                session = session if isinstance(session, dict) else {}   # no usable block -> session_hours stops
                 break
             except NotFound:
                 continue
@@ -455,8 +473,8 @@ class Collector:
         closed = codes_from_list_page(self.http.text(WWW + CLOSED_PATH), "companies/closed")
         uni, source = build_universe(prices, lambda: self.http.json(WWW + DAY_END_PATH), going, closed,
                                      after_open=self.dhaka() >= open_at)
-        self.log(f"universe {len(uni)} codes (source {source}; minus {len(going)} going-concern, {len(closed)} closed); "
-                 f"DSE hours {op[0]:02d}:{op[1]:02d}-{cl[0]:02d}:{cl[1]:02d}")
+        self.log(f"universe {len(uni)} codes (source {source}; minus {len(going)} going-concern, "
+                 f"{len(closed)} closed); DSE hours {op[0]:02d}:{op[1]:02d}-{cl[0]:02d}:{cl[1]:02d}")
         self._write_status(universe_size=len(uni), universe_source=source)
         self._sleep_until(open_at)
         return self._collect(uni, day, test=False, close_at=close_at, open_at=open_at)
@@ -464,7 +482,7 @@ class Collector:
     def _collect(self, codes, day, test, close_at, open_at) -> int:
         path = self._csv_path(day, test)
         new = not os.path.exists(path)
-        skip, seen_open, total = set(), False, 0
+        skip, seen_open, total, closed_since = set(), False, 0, None
         self.last_session = {}
         with open(path, "a", newline="", encoding="utf-8") as f:
             w = csv.writer(f)
@@ -487,9 +505,11 @@ class Collector:
                     f.flush()
                     is_open = self.last_session.get("isOpen")
                     if is_open is True:
-                        seen_open = True
+                        seen_open, closed_since = True, None
                     elif is_open is False and seen_open and not test:
-                        return self._done("DSE reports the session closed", passes, total)
+                        closed_since = closed_since or self.dhaka()        # one stray answer does not end the day
+                        if (self.dhaka() - closed_since).total_seconds() >= CLOSED_CONFIRM_S:
+                            return self._done("DSE reports the session closed", passes, total)
                     if (not test and not seen_open and open_at is not None
                             and (self.dhaka() - open_at).total_seconds() > NEVER_OPEN_GRACE_S):
                         return self._done("DSE never reported the session open", passes, total)
@@ -516,25 +536,32 @@ def finalize(out_dir: str) -> str:
     st = {}
     sp = os.path.join(out_dir, "status.json")
     if os.path.exists(sp):
-        with open(sp, encoding="utf-8") as f:
-            st = json.load(f)
+        try:
+            with open(sp, encoding="utf-8") as f:
+                st = json.load(f)
+        except (OSError, ValueError) as e:           # unreadable status: the rows still ship, marked incomplete
+            st = {"state": "unknown", "stop_reason": f"status.json not readable ({type(e).__name__})"}
     dest_dir = os.path.join(out_dir, name)
     os.makedirs(dest_dir, exist_ok=True)
     gz = os.path.join(dest_dir, name + ".csv.gz")
     rows, dropped = 0, 0
-    with open(src, newline="", encoding="utf-8") as f, gzip.open(gz, "wt", newline="", encoding="utf-8") as g:
+    with open(src, "rb") as f:
+        raw = f.read().decode("utf-8", "replace")
+    if raw and not raw.endswith("\n"):               # the job was killed mid-line: the last line is not whole
+        raw, dropped = raw[:raw.rfind("\n") + 1], 1
+    with gzip.open(gz, "wt", newline="", encoding="utf-8") as g:
         w = csv.writer(g)
-        rd = csv.reader(f)
+        rd = csv.reader(io.StringIO(raw, newline=""))
         header = next(rd, None)
-        if header != CSV_COLS:
+        if header is not None and header != CSV_COLS:
             raise SystemExit(f"{src}: unexpected header {header}")
-        w.writerow(CSV_COLS)
+        w.writerow(CSV_COLS)                         # an empty file (killed before the first flush) ships 0 rows
         for r in rd:
             if len(r) == len(CSV_COLS) and r[0] and r[1]:
                 w.writerow(r)
                 rows += 1
             else:
-                dropped += 1                         # a line cut off when the job was killed
+                dropped += 1                         # a malformed line
     with open(gz, "rb") as f:
         sha = hashlib.sha256(f.read()).hexdigest()
     manifest = {"name": name, "day": name.split("-", 1)[1], "file": name + ".csv.gz", "rows": rows, "sha256": sha,
@@ -551,7 +578,8 @@ def universe_check(http: Http, now: datetime, log=print) -> int:
     """Manual check: both universe paths, list sizes, the first rows - no depth calls, nothing saved."""
     prices = http.json(WWW + PRICES_PATH)
     rows = rows_as_dicts(prices)
-    log(f"prices: {len(rows)} rows; keys {sorted(rows[0]) if rows else []}; session {json.dumps(prices.get('session') if isinstance(prices, dict) else None)[:300]}")
+    sess = prices.get("session") if isinstance(prices, dict) else None
+    log(f"prices: {len(rows)} rows; keys {sorted(rows[0]) if rows else []}; session {json.dumps(sess)[:300]}")
     log(f"prices: EQ {len(eq_codes(rows))}, EQ with trades>0 {len(traded_codes(rows, True))}")
     de = http.json(WWW + DAY_END_PATH)
     de_rows = rows_as_dicts(de)
