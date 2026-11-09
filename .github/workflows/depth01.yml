@@ -1,0 +1,56 @@
+name: depth01
+
+# One run per DSE day (Sun-Thu). 03:41 UTC = 09:41 Dhaka (odd minute, before the 10:00 open); the collector exits
+# by itself on holidays and outside the session, and waits for the open when it starts early.
+on:
+  schedule:
+    - cron: "41 3 * * 0-4"
+  workflow_dispatch:
+    inputs:
+      codes:
+        description: "Test: comma list (e.g. SPCL,GP) - one pass, no session gate. Empty = the normal run."
+        required: false
+        default: ""
+      universe_only:
+        description: "Only build and print the universe (no depth requests, no artifact)."
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: depth01
+  cancel-in-progress: false
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Universe check
+        if: ${{ inputs.universe_only == true }}
+        run: python3 collector.py universe
+
+      - name: Collect
+        if: ${{ inputs.universe_only != true }}
+        env:
+          CODES: ${{ inputs.codes }}
+        run: python3 collector.py run --out out --codes "${CODES:-}"
+
+      - name: Finalize (also after a failure)
+        id: fin
+        if: ${{ always() && inputs.universe_only != true }}
+        run: python3 collector.py finalize --out out
+
+      - name: Upload the day
+        if: ${{ always() && steps.fin.outputs.name != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.fin.outputs.name }}
+          path: out/${{ steps.fin.outputs.name }}/
+          retention-days: 90
+          compression-level: 0
+          if-no-files-found: error
