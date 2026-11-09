@@ -2,7 +2,9 @@
 """DEPTH01 collector - the DSE public top-10 order book (market depth), snapshotted through one trading session.
 
 What it does (one GitHub Actions job per day, Sun-Thu, started a little before 10:00 Dhaka):
-  1. Exits at once on Friday/Saturday, on a DSE holiday (www.dse.com.bd/holidays) and when the session is over.
+  1. Exits at once on Friday/Saturday and on a DSE holiday (www.dse.com.bd/holidays). The session hours come only
+     from DSE's own session block (api/live/depth session.today opening/closing) - none are built in; DSE not
+     giving them stops the day. It exits when DSE says it is not a trading day or the job starts after DSE's close.
   2. Builds the day's universe: equities (assetType EQ) that traded the previous session, from api/live/prices
      (or, when that list is already reset to 0 trades or the job started after the open, from
      api/live/data-archive/day-end), MINUS the going-concern list (www.dse.com.bd/going-concern) MINUS the
@@ -56,8 +58,6 @@ HOLIDAYS_PATH = "/holidays"
 MIN_GAP_S = 2.0                              # one request every 2 s, one at a time
 BACKOFF_S = (2, 4, 8, 16, 32, 60)            # 2 s doubling to 60 s; still failing after these -> stop the day
 TIMEOUT_S = 20
-DEFAULT_OPEN = (10, 0)                       # used only when the session JSON gives no time (logged)
-DEFAULT_CLOSE = (14, 0)
 NEVER_OPEN_GRACE_S = 30 * 60                 # DSE never reports the session open this long after the open -> stop
 CSV_COLS = ["session_date", "fetch_utc", "as_of", "phase", "trading_code", "side", "level", "price", "quantity",
             "orders"]
@@ -351,12 +351,14 @@ def _hhmm(v):
 
 
 def session_hours(session: dict):
-    """(open, close, note) as (h, m) tuples from session.today (or session.opening/closing)."""
+    """(open, close) as (h, m) from DSE's session block (session.today, else session.opening/closing).
+    No built-in hours: DSE not giving them stops the day."""
     today = session.get("today") if isinstance(session.get("today"), dict) else {}
     op = _hhmm(today.get("opening")) or _hhmm(session.get("opening"))
     cl = _hhmm(today.get("closing")) or _hhmm(session.get("closing"))
-    note = "" if (op and cl) else "session JSON gave no hours: default 10:00-14:00"
-    return op or DEFAULT_OPEN, cl or DEFAULT_CLOSE, note
+    if not (op and cl) or cl <= op:
+        raise StopDay(f"DSE session block gives no usable opening/closing time: {json.dumps(session)[:200]}")
+    return op, cl
 
 
 # ------------------------------------------------------------------ the run
@@ -424,8 +426,6 @@ class Collector:
             return self._collect(codes, day, test=True, close_at=None, open_at=None)
         if start.weekday() in WEEKEND:
             return self._exit("Friday/Saturday")
-        if start.time() >= datetime.min.replace(hour=DEFAULT_CLOSE[0], minute=DEFAULT_CLOSE[1]).time():
-            return self._exit(f"started {start:%H:%M} Dhaka, after the close")
         try:
             hol = holidays_from_page(self.http.text(WWW + HOLIDAYS_PATH), start.year)
             if start.date() in hol:
@@ -433,31 +433,31 @@ class Collector:
         except ValueError as e:                     # page read but not parsable: the session JSON still gates
             self.log(f"WARNING holidays page not parsed ({e}); relying on the session JSON")
         prices = self.http.json(WWW + PRICES_PATH)
-        going = codes_from_list_page(self.http.text(WWW + GOING_CONCERN_PATH), "going-concern")
-        closed = codes_from_list_page(self.http.text(WWW + CLOSED_PATH), "companies/closed")
-        after_open = start.time() >= datetime.min.replace(hour=DEFAULT_OPEN[0], minute=DEFAULT_OPEN[1]).time()
-        uni, source = build_universe(prices, lambda: self.http.json(WWW + DAY_END_PATH), going, closed, after_open)
-        self.log(f"universe {len(uni)} codes (source {source}; minus {len(going)} going-concern, {len(closed)} closed)")
-        self._write_status(universe_size=len(uni), universe_source=source)
         session = None
-        for code in uni:                            # the session block, from the first code DSE answers for
+        for code in sorted(eq_codes(rows_as_dicts(prices))):   # DSE's session block, from the first EQ code answered
             try:
                 session = (self.http.json(DEPTH_HOST + DEPTH_PATH.format(code=code)) or {}).get("session") or {}
                 break
             except NotFound:
                 continue
         if session is None:
-            raise StopDay("api/live/depth answered 404 for every code of the universe")
+            raise StopDay("api/live/depth answered 404 for every EQ code")
         if session.get("tradingDay") is False:
             return self._exit("DSE session JSON: not a trading day")
-        op, cl, note = session_hours(session)
-        if note:
-            self.log("WARNING " + note)
-        open_at = start.replace(hour=op[0], minute=op[1], second=0, microsecond=0)
-        close_at = start.replace(hour=cl[0], minute=cl[1], second=0, microsecond=0)
+        op, cl = session_hours(session)             # hours only from DSE, never built in
+        now = self.dhaka()
+        open_at = now.replace(hour=op[0], minute=op[1], second=0, microsecond=0)
+        close_at = now.replace(hour=cl[0], minute=cl[1], second=0, microsecond=0)
         self._write_status(open=f"{op[0]:02d}:{op[1]:02d}", close=f"{cl[0]:02d}:{cl[1]:02d}")
-        if self.dhaka() >= close_at:
-            return self._exit(f"after the close ({cl[0]:02d}:{cl[1]:02d})")
+        if now >= close_at:
+            return self._exit(f"after DSE's close ({cl[0]:02d}:{cl[1]:02d})")
+        going = codes_from_list_page(self.http.text(WWW + GOING_CONCERN_PATH), "going-concern")
+        closed = codes_from_list_page(self.http.text(WWW + CLOSED_PATH), "companies/closed")
+        uni, source = build_universe(prices, lambda: self.http.json(WWW + DAY_END_PATH), going, closed,
+                                     after_open=self.dhaka() >= open_at)
+        self.log(f"universe {len(uni)} codes (source {source}; minus {len(going)} going-concern, {len(closed)} closed); "
+                 f"DSE hours {op[0]:02d}:{op[1]:02d}-{cl[0]:02d}:{cl[1]:02d}")
+        self._write_status(universe_size=len(uni), universe_source=source)
         self._sleep_until(open_at)
         return self._collect(uni, day, test=False, close_at=close_at, open_at=open_at)
 
