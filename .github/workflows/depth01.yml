@@ -1,10 +1,16 @@
 name: depth01
 
-# One run per DSE day (Sun-Thu). 03:41 UTC = 09:41 Dhaka (odd minute, before the 10:00 open); the collector exits
-# by itself on holidays and outside the session, and waits for the open when it starts early.
+# One collection per DSE day (Sun-Thu). GitHub can start a scheduled run hours late (2026-11-10: the 09:41 run started
+# at 17:47 Dhaka), so there are backup starts every 30 min from 09:11 to 11:41 Dhaka (03:11-05:41 UTC, odd minutes).
+# The concurrency group below runs them one at a time: a backup waits while a run collects, then starts after the
+# close and exits; a backup that starts in the session after a failed run collects the rest of the day (the import
+# merges several artifacts of one day). The collector exits by itself on holidays and outside the session, and waits
+# for the open when it starts early.
 on:
   schedule:
-    - cron: "41 3 * * 0-4"
+    - cron: "11,41 3 * * 0-4"
+    - cron: "11,41 4 * * 0-4"
+    - cron: "11,41 5 * * 0-4"
   workflow_dispatch:
     inputs:
       codes:
@@ -26,7 +32,7 @@ concurrency:
 jobs:
   collect:
     runs-on: ubuntu-latest
-    timeout-minutes: 330
+    timeout-minutes: 355            # GitHub's limit is 360
     steps:
       - uses: actions/checkout@v4
 
@@ -36,7 +42,8 @@ jobs:
 
       - name: Collect
         if: ${{ inputs.universe_only != true }}
-        timeout-minutes: 310            # below the job's 330: finalize + upload still run after a hang
+        timeout-minutes: 340            # below the job's 355: finalize + upload still run after a hang; a 09:11 start
+                                        # is cut at 14:51 Dhaka at the earliest, after a 14:30 close
         env:
           CODES: ${{ inputs.codes }}
         run: python3 collector.py run --out out --codes "${CODES:-}"

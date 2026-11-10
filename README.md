@@ -4,7 +4,9 @@ Collects the Dhaka Stock Exchange's public top-10 order book (market depth) thro
 keeps each day as a GitHub Actions artifact. Personal research data. No trading code here.
 
 ## What runs
-`.github/workflows/depth01.yml` runs `collector.py` once a day, Sunday to Thursday, at 09:41 Dhaka (03:41 UTC).
+`.github/workflows/depth01.yml` runs `collector.py` once a day, Sunday to Thursday, starting at 09:11 Dhaka (03:11 UTC)
+with backup starts every 30 min to 11:41 Dhaka, because GitHub can start a scheduled run hours late. The runs go one
+at a time; a backup that starts after a finished day exits at once.
 The collector:
 
 - exits at once on Friday and Saturday, on DSE holidays (read from www.dse.com.bd/holidays) and when it starts
